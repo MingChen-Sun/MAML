@@ -4,13 +4,14 @@ import torch.nn.functional as F
 import numpy as np
 import copy
 from Get_Args import get_args
-from Model import Net,CNN,CNN_Casual
+from Model import Net,CNN,CNN_Casual,GCN,GCN_Filter
 from torch.utils.data import DataLoader
 from Dataset import MyDataSet
-from DataGenerate import Task_Generater_Sin,Task_Generater_MINST
+from DataGenerate import Task_Generater_Sin,Task_Generater_MINST,Task_Generater_Cora
 import matplotlib.pyplot as plt
 import time
 import torchvision
+from dgl.data import CoraGraphDataset as CoraGraphDataset
 
 class MAML(nn.Module):
     def __init__(self, model,args):
@@ -36,6 +37,8 @@ class MAML(nn.Module):
         self.i_opt=torch.optim.Adam(self.model.parameters(), lr=self.args.lr, weight_decay=self.args.weight_decay)
         self.o_opt=torch.optim.Adam(self.model.parameters(), lr=self.args.lr, weight_decay=self.args.weight_decay)
         
+    def inject_graph(self,g):
+        self.g=g.to(self.args.device)
 
     def get_model(self):
         return copy.deepcopy(self.model)
@@ -44,6 +47,10 @@ class MAML(nn.Module):
         '''
         i_os inner optimize step per task defult 1 type: int
         '''
+        ########
+        features = self.g.ndata['feat'].to(self.args.device)
+        labels = self.g.ndata['label'].to(self.args.device)
+        ########
         everage_loss=0
         for index,(batch_x, batch_y) in enumerate(dataloader):
             self.train()
@@ -57,8 +64,8 @@ class MAML(nn.Module):
                 theta=copy.deepcopy(theta_)
                 self.model.load_parameters(theta)
                 for _ in range(i_os):
-                    y_spt_pre=self.model(batch_x[i][0])
-                    i_spt_loss=self.i_lf(y_spt_pre,batch_y[i][0])#loss function input target
+                    y_spt_pre=self.model(features)
+                    i_spt_loss=self.i_lf(y_spt_pre[batch_x[i][0]],labels[batch_y[i][0]])#loss function input target
                     self.i_opt.zero_grad()
                     i_spt_loss.backward()
                     self.i_opt.step()
@@ -66,8 +73,8 @@ class MAML(nn.Module):
             o_loss=0
             for i in range(self.args.batch_size):
                 self.model.load_parameters(parameters_list[i])
-                y_qry_pre=self.model(batch_x[i][1])
-                i_qry_loss=self.i_lf(y_qry_pre,batch_y[i][1])
+                y_qry_pre=self.model(features)
+                i_qry_loss=self.i_lf(y_qry_pre[batch_x[i][1]],labels[batch_y[i][1]])
                 o_loss=o_loss+(i_qry_loss)
 
             theta=copy.deepcopy(theta_)
@@ -81,6 +88,10 @@ class MAML(nn.Module):
         return everage_loss
 
     def evaluation(self,fine_tuning_step,task):
+        ########
+        features = self.g.ndata['feat'].to(self.args.device)
+        labels = self.g.ndata['label'].to(self.args.device)
+        ########
         x,y=task
         device=self.args.device
         x_spt,x_qry=x
@@ -91,50 +102,42 @@ class MAML(nn.Module):
         f_opt=torch.optim.Adam(model_copy.parameters(), lr=self.args.lr, weight_decay=self.args.weight_decay)
         for _ in range(fine_tuning_step):
             model_copy.train()
-            y_pre=model_copy(x_spt.to(device))
-            loss=f_lf(y_pre,y_spt.to(device))
+            y_pre=model_copy(features.to(device))
+
+            loss=f_lf(y_pre[x_spt],labels[y_spt].to(device))
             f_opt.zero_grad()
             loss.backward()
             f_opt.step()
             
 
         model_copy.eval()
-        output=model_copy(x_qry.to(device))
-        prediction = torch.argmax(output, 1)
-        correct = (prediction == y_qry.to(device)).sum().float()/y_qry.shape[0]
+        output=model_copy(features.to(device))
+        prediction = torch.argmax(output[x_qry], 1)
+        correct = (prediction == labels[y_qry].to(device)).sum().float()/labels[y_qry].shape[0]
         return correct
         
         
 
 if __name__ == "__main__":
+    
     args=get_args()
-    model = CNN()
-
+    data_source = CoraGraphDataset()
+    model = GCN_Filter(data_source[0].to(args.device),args.input_size, args.hidden_size, args.output_size, F.relu, 0.3)
+    # model = GCN(data_source[0].to(args.device),args.input_size, args.hidden_size, args.output_size, F.relu, 0.3)
     maml=MAML(model,args)
-    data=torchvision.datasets.MNIST('./MNIST/',train=True,download=True,
-                        transform=torchvision.transforms.Compose([
-                            torchvision.transforms.ToTensor(),
-                            torchvision.transforms.Normalize((0.1307,), (0.3081,))
-                            ]))
-    MNIST=Task_Generater_MINST([0,1,2,3,4,5,6,7,8,9],3,2,5,data)
-
-    data_test=torchvision.datasets.MNIST('./MNIST/',train=False,download=True,
-                        transform=torchvision.transforms.Compose([
-                            torchvision.transforms.ToTensor(),
-                            torchvision.transforms.Normalize((0.1307,), (0.3081,))
-                            ]))
-    MNIST_test=Task_Generater_MINST([8,9],2,10,50,data_test)
-
+    maml.inject_graph(data_source[0].to(args.device))
+    Cora_train=Task_Generater_Cora(data_source[0].to(args.device),7,5,10,train_flag=True)
+    Cora_test=Task_Generater_Cora(data_source[0].to(args.device),7,50,100,train_flag=False)
     loss_t=[]
-    for e in range(5000):
-        dataset = MyDataSet(args.task_num,MNIST)
+    for e in range(1000):
+        dataset = MyDataSet(args.task_num,Cora_train)
         dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=False)
         loss=maml(dataloader)
         loss_t.append(loss.cpu().detach().numpy())
         if e%25==0:
-            #print(loss)
+            print(loss)
             ##########
-            acc=maml.evaluation(20,MNIST_test.generate())
+            acc=maml.evaluation(20,Cora_test.generate())
             print("Test ACC value : ",acc.cpu().numpy())
             ##########
     

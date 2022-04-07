@@ -7,7 +7,7 @@ from Get_Args import get_args
 from Model import Net,CNN,CNN_Casual
 from torch.utils.data import DataLoader
 from Dataset import MyDataSet
-from DataGenerate import Task_Generater_Sin,Task_Generater_MINST
+from DataGenerate import Task_Generater,Task_Generater_MINST
 import matplotlib.pyplot as plt
 import time
 import torchvision
@@ -16,12 +16,10 @@ class MAML(nn.Module):
     def __init__(self, model,args):
         '''
         model input base model type: nn.Moudle
-        i_lf  inner loss function type: function
-        o_lf  outer loss function type: function
-        f_lf  fine-tuning losss funtion type: function
+        i_lf inner loss function type: function
+        o_lf outer loss function type: function
         i_opt inner optimizer type:
         o_opt outer optimizer type:
-        f_opt fine-tuning optimizer type:
         '''
         super(MAML, self).__init__()
         self.args=args
@@ -32,10 +30,8 @@ class MAML(nn.Module):
         '''
         self.i_lf=nn.CrossEntropyLoss()#nn.MSELoss()
         self.o_lf=nn.CrossEntropyLoss()#nn.MSELoss()
-        
         self.i_opt=torch.optim.Adam(self.model.parameters(), lr=self.args.lr, weight_decay=self.args.weight_decay)
         self.o_opt=torch.optim.Adam(self.model.parameters(), lr=self.args.lr, weight_decay=self.args.weight_decay)
-        
 
     def get_model(self):
         return copy.deepcopy(self.model)
@@ -44,9 +40,9 @@ class MAML(nn.Module):
         '''
         i_os inner optimize step per task defult 1 type: int
         '''
+        self.train()
         everage_loss=0
         for index,(batch_x, batch_y) in enumerate(dataloader):
-            self.train()
             theta_=copy.deepcopy(self.model.get_parameters())
             parameters_list=[]
             execute_x=[[batch_x[0][i].to(self.args.device),batch_x[1][i].to(self.args.device)] for i in range(self.args.batch_size)]
@@ -59,6 +55,11 @@ class MAML(nn.Module):
                 for _ in range(i_os):
                     y_spt_pre=self.model(batch_x[i][0])
                     i_spt_loss=self.i_lf(y_spt_pre,batch_y[i][0])#loss function input target
+                    #### constraint
+                    mask_matrix=maml.get_model().get_mask_matrix()
+                    loss_c=(mask_matrix**2).sum() / 2
+                    i_spt_loss=i_spt_loss+args.lc*loss_c
+                    ####
                     self.i_opt.zero_grad()
                     i_spt_loss.backward()
                     self.i_opt.step()
@@ -69,10 +70,16 @@ class MAML(nn.Module):
                 y_qry_pre=self.model(batch_x[i][1])
                 i_qry_loss=self.i_lf(y_qry_pre,batch_y[i][1])
                 o_loss=o_loss+(i_qry_loss)
-
+            
             theta=copy.deepcopy(theta_)
             self.model.load_parameters(theta)
+
             o_loss=o_loss/len(batch_x)
+            #### constraint
+            mask_matrix=maml.get_model().get_mask_matrix()
+            loss_c=(mask_matrix**2).sum() / 2
+            o_loss=o_loss+args.lc*loss_c
+            ####
             self.o_opt.zero_grad()
             o_loss.backward()
             self.o_opt.step()
@@ -80,79 +87,66 @@ class MAML(nn.Module):
         everage_loss=everage_loss/len(dataloader)
         return everage_loss
 
-    def evaluation(self,fine_tuning_step,task):
-        x,y=task
-        device=self.args.device
-        x_spt,x_qry=x
-        y_spt,y_qry=y
-
-        model_copy=self.get_model()
-        f_lf=nn.CrossEntropyLoss()
-        f_opt=torch.optim.Adam(model_copy.parameters(), lr=self.args.lr, weight_decay=self.args.weight_decay)
-        for _ in range(fine_tuning_step):
-            model_copy.train()
-            y_pre=model_copy(x_spt.to(device))
-            loss=f_lf(y_pre,y_spt.to(device))
-            f_opt.zero_grad()
-            loss.backward()
-            f_opt.step()
-            
-
-        model_copy.eval()
-        output=model_copy(x_qry.to(device))
-        prediction = torch.argmax(output, 1)
-        correct = (prediction == y_qry.to(device)).sum().float()/y_qry.shape[0]
-        return correct
+    
         
         
 
 if __name__ == "__main__":
     args=get_args()
-    model = CNN()
+    #model = CNN()#Net(args.input_size, args.hidden_size, args.output_size, F.relu)
+    model = CNN_Casual()
 
     maml=MAML(model,args)
+    #data=torchvision.datasets.MNIST('./MNIST/',train=True,download=True,transform=torchvision.transforms.Compose([torchvision.transforms.ToTensor()]))
     data=torchvision.datasets.MNIST('./MNIST/',train=True,download=True,
                         transform=torchvision.transforms.Compose([
                             torchvision.transforms.ToTensor(),
                             torchvision.transforms.Normalize((0.1307,), (0.3081,))
                             ]))
-    MNIST=Task_Generater_MINST([0,1,2,3,4,5,6,7,8,9],3,2,5,data)
-
-    data_test=torchvision.datasets.MNIST('./MNIST/',train=False,download=True,
-                        transform=torchvision.transforms.Compose([
-                            torchvision.transforms.ToTensor(),
-                            torchvision.transforms.Normalize((0.1307,), (0.3081,))
-                            ]))
-    MNIST_test=Task_Generater_MINST([8,9],2,10,50,data_test)
+    MNIST=Task_Generater_MINST([0,1,2,3,4,5,6,7],3,2,5,data)
 
     loss_t=[]
-    for e in range(5000):
+    for e in range(1000):
         dataset = MyDataSet(args.task_num,MNIST)
         dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=False)
         loss=maml(dataloader)
         loss_t.append(loss.cpu().detach().numpy())
-        if e%25==0:
-            #print(loss)
-            ##########
-            acc=maml.evaluation(20,MNIST_test.generate())
-            print("Test ACC value : ",acc.cpu().numpy())
-            ##########
+        if e%10==0:
+            print(loss)
     
     plt.figure()
     plt.plot(loss_t)
     plt.savefig('./pic.png')
-
     
-
-
+    '''
+    '''
+    print(maml.get_model().get_mask_matrix().cpu().numpy())
+    #######
+    plt.figure()
+    mask_matrix=maml.get_model().get_mask_matrix().cpu().numpy()
+    plt.imshow(mask_matrix,cmap='rainbow')
+    plt.colorbar()
+    plt.savefig('./mask_matrix.png')
+    
+    #######
+    
     #Test
-    # plt.figure(figsize=(20,10))
-    # for i in range(10):
-    #     x,y=Task_Generater(args.sample_num_spt,args.sample_num_qry).sampler(100)
-    #     y_pre=maml.get_model()(x)
-    #     plt.subplot(2,5,i+1)
-    #     plt.scatter(x,y)
-    #     plt.scatter(x,y_pre.detach().numpy())
-    # plt.savefig('./exa.png')
+    plt.figure(figsize=(100,50))
+    for i in range(21):
+        plt.subplot(3,7,i+1)
+        plt.imshow(data[i][0][0],cmap='rainbow')
+        plt.colorbar()
+        #plt.imshow(mask_matrix, alpha=0.4, cmap='rainbow')
+    plt.savefig('./pic_data_o.png')   
+
+    plt.figure(figsize=(100,50))
+    for i in range(21):
+        plt.subplot(3,7,i+1)
+        mask_matrix=maml.get_model().get_mask_matrix().cpu()
+        x_mask=data[i][0][0]*mask_matrix
+        plt.imshow(x_mask,cmap='rainbow')
+        #plt.imshow(mask_matrix, alpha=0.4, cmap='rainbow')
+        plt.colorbar()
+    plt.savefig('./pic_data.png')
 
 
