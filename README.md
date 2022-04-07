@@ -8,3 +8,4 @@ This project contains a task generation file, which can generate the encapsulate
 Each task contains two part x and y that equals a tuple respectively
 x=(x^spt and x^qry)
 y=(y^spt and y^qry)
+# This project contains graph,picture and grid data training exapmle
